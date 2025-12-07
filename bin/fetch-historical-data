@@ -1,0 +1,298 @@
+#!/usr/bin/env node
+/**
+ * Fast parallel historical Tor relay data fetcher
+ * 
+ * Features:
+ * - Parallel downloads
+ * - TRUE parallel processing (async tar extraction)
+ * - MaxMind for instant geolocation
+ * - Local archive cache
+ */
+
+'use strict';
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const maxmind = require('maxmind');
+
+const execAsync = promisify(exec);
+
+// Configuration
+const GEOIP_DB_PATH = path.join(__dirname, '..', 'data', 'geoip', 'GeoLite2-City.mmdb');
+const CACHE_DIR = path.join(__dirname, '..', 'data', 'cache');
+const OUTPUT_DIR = path.join(__dirname, '..', 'data', 'historical');
+
+// Country centroids for fallback
+const COUNTRY_CENTROIDS = {
+    'US': [-95.71, 37.09], 'DE': [10.45, 51.17], 'FR': [2.21, 46.23], 'NL': [5.29, 52.13],
+    'GB': [-3.44, 55.38], 'CA': [-106.35, 56.13], 'SE': [18.64, 60.13], 'CH': [8.23, 46.82],
+    'RU': [105.32, 61.52], 'AU': [133.78, -25.27], 'JP': [138.25, 36.20], 'IT': [12.57, 41.87]
+};
+
+let geoReader = null;
+
+// Status
+const status = { downloaded: 0, cached: 0, failed: 0, processed: 0, skipped: 0, totalRelays: 0, totalGeo: 0, active: new Set() };
+
+function updateStatus(phase, total) {
+    const active = Array.from(status.active).sort().slice(0, 8).join(' ');
+    const more = status.active.size > 8 ? ` +${status.active.size - 8}` : '';
+    
+    if (phase === 'download') {
+        const done = status.downloaded + status.cached + status.failed;
+        process.stdout.write(`\r  [${done}/${total}] ✓${status.downloaded} ◆${status.cached} ✗${status.failed} | ${active}${more}                    `);
+    } else {
+        const done = status.processed + status.skipped;
+        process.stdout.write(`\r  [${done}/${total}] ✓${status.processed} ○${status.skipped} | ${status.totalRelays.toLocaleString()} relays | ${active}${more}                    `);
+    }
+}
+
+// Parse consensus
+function parseConsensus(text) {
+    const relays = [];
+    const lines = text.split('\n');
+    let current = null;
+    
+    for (const line of lines) {
+        if (line.startsWith('r ')) {
+            if (current) relays.push(current);
+            const p = line.split(' ');
+            if (p.length >= 9) current = { nickname: p[1], fingerprint: p[2], ip: p[6], port: p[7], flags: 'M', bandwidth: 0 };
+        } else if (line.startsWith('s ') && current) {
+            const f = line.substring(2).split(' ');
+            current.flags = (f.includes('Running')?'M':'') + (f.includes('Guard')?'G':'') + (f.includes('Exit')?'E':'') + (f.includes('HSDir')?'H':'') || 'M';
+        } else if (line.startsWith('w ') && current) {
+            const m = line.match(/Bandwidth=(\d+)/);
+            if (m) current.bandwidth = parseInt(m[1]);
+        }
+    }
+    if (current) relays.push(current);
+    return relays;
+}
+
+function geolocateIP(ip) {
+    if (!geoReader) return null;
+    try {
+        const r = geoReader.get(ip);
+        if (r && r.location) return { lat: r.location.latitude, lng: r.location.longitude };
+    } catch (e) {}
+    return null;
+}
+
+function getFallback() {
+    const keys = Object.keys(COUNTRY_CENTROIDS);
+    const c = COUNTRY_CENTROIDS[keys[Math.floor(Math.random() * keys.length)]];
+    return { lat: c[1] + (Math.random() - 0.5) * 4, lng: c[0] + (Math.random() - 0.5) * 4 };
+}
+
+function relaysToCSV(relays) {
+    const header = 'Name,Fingerprint,Flags,IP,OrPort,ObservedBW,Uptime,GuardClients,DirClients,Longitude,Latitude)';
+    const maxBw = Math.max(...relays.map(r => r.bandwidth || 0), 1);
+    let geoCount = 0;
+    
+    const lines = relays.map(r => {
+        let geo = geolocateIP(r.ip);
+        if (geo) geoCount++; else geo = getFallback();
+        return [(r.nickname||'').replace(/,/g,''), r.fingerprint||'', r.flags||'M', r.ip||'0.0.0.0', r.port||'9001',
+                ((r.bandwidth||0)/maxBw).toFixed(6), '', '', r.bandwidth||0, geo.lng, geo.lat].join(',');
+    });
+    
+    return { csv: [header, ...lines].join('\n'), geoCount };
+}
+
+// Download with promise
+function downloadFile(url, dest) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        https.get(url, res => {
+            if (res.statusCode !== 200) { fs.unlinkSync(dest); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+            res.pipe(file);
+            file.on('finish', () => { file.close(); resolve(); });
+        }).on('error', e => { fs.unlink(dest, ()=>{}); reject(e); });
+    });
+}
+
+// Download archive (async)
+async function downloadArchive(year, month, total) {
+    const monthStr = `${year}-${String(month).padStart(2, '0')}`;
+    const cachePath = path.join(CACHE_DIR, `consensuses-${monthStr}.tar.xz`);
+    
+    status.active.add(monthStr);
+    updateStatus('download', total);
+    
+    try {
+        if (fs.existsSync(cachePath) && fs.statSync(cachePath).size > 1000) {
+            status.cached++;
+            status.active.delete(monthStr);
+            updateStatus('download', total);
+            return { monthStr, cachePath, cached: true };
+        }
+        
+        await downloadFile(`https://collector.torproject.org/archive/relay-descriptors/consensuses/consensuses-${monthStr}.tar.xz`, cachePath);
+        status.downloaded++;
+    } catch (e) {
+        status.failed++;
+    }
+    
+    status.active.delete(monthStr);
+    updateStatus('download', total);
+    return { monthStr, cachePath: fs.existsSync(cachePath) ? cachePath : null };
+}
+
+// Process archive (ASYNC - true parallel!)
+async function processArchive(monthStr, cachePath, total) {
+    const csvPath = path.join(OUTPUT_DIR, `relays-${monthStr}-01-00-00-00.csv`);
+    
+    status.active.add(monthStr);
+    updateStatus('process', total);
+    
+    if (fs.existsSync(csvPath)) {
+        status.skipped++;
+        status.active.delete(monthStr);
+        updateStatus('process', total);
+        return { monthStr, skipped: true };
+    }
+    
+    if (!cachePath || !fs.existsSync(cachePath)) {
+        status.skipped++;
+        status.active.delete(monthStr);
+        updateStatus('process', total);
+        return { monthStr, skipped: true };
+    }
+    
+    try {
+        // ASYNC tar operations - allows true parallelism!
+        const { stdout: fileList } = await execAsync(`tar -tf "${cachePath}" --xz 2>/dev/null | grep -E "${monthStr}-0[1-5]-" | head -1`, { maxBuffer: 1024 * 1024 });
+        const consensusFile = fileList.trim();
+        
+        if (!consensusFile) {
+            status.skipped++;
+            status.active.delete(monthStr);
+            updateStatus('process', total);
+            return { monthStr, skipped: true };
+        }
+        
+        const { stdout: consensusText } = await execAsync(`tar -xf "${cachePath}" --xz -O "${consensusFile}" 2>/dev/null`, { maxBuffer: 50 * 1024 * 1024 });
+        
+        const relays = parseConsensus(consensusText);
+        if (relays.length === 0) {
+            status.skipped++;
+            status.active.delete(monthStr);
+            updateStatus('process', total);
+            return { monthStr, skipped: true };
+        }
+        
+        const { csv, geoCount } = relaysToCSV(relays);
+        fs.writeFileSync(csvPath, csv);
+        
+        status.processed++;
+        status.totalRelays += relays.length;
+        status.totalGeo += geoCount;
+        status.active.delete(monthStr);
+        updateStatus('process', total);
+        
+        return { monthStr, success: true, relays: relays.length, geo: geoCount };
+    } catch (e) {
+        status.skipped++;
+        status.active.delete(monthStr);
+        updateStatus('process', total);
+        return { monthStr, skipped: true, error: e.message };
+    }
+}
+
+// Parallel runner
+async function runParallel(tasks, concurrency) {
+    const results = [];
+    const executing = new Set();
+    
+    for (const task of tasks) {
+        const p = task().then(r => { executing.delete(p); return r; });
+        results.push(p);
+        executing.add(p);
+        
+        if (executing.size >= concurrency) await Promise.race(executing);
+    }
+    
+    return Promise.all(results);
+}
+
+// Generate months
+function generateMonths(sy, sm, ey, em) {
+    const months = [];
+    let y = sy, m = sm;
+    while (y < ey || (y === ey && m <= em)) {
+        months.push({ year: y, month: m });
+        if (++m > 12) { m = 1; y++; }
+    }
+    return months;
+}
+
+// Main
+async function main() {
+    const args = process.argv.slice(2);
+    let startYear = 2015, startMonth = 1, endYear = 2025, endMonth = 11, parallel = 15, reprocess = false;
+    
+    args.forEach(a => {
+        if (a.startsWith('--start=')) { const [y,m] = a.slice(8).split('-'); startYear = +y; startMonth = +m || 1; }
+        else if (a.startsWith('--end=')) { const [y,m] = a.slice(6).split('-'); endYear = +y; endMonth = +m || 12; }
+        else if (a.startsWith('--parallel=')) parallel = +a.slice(11) || 15;
+        else if (a === '--reprocess') reprocess = true;
+    });
+    
+    [CACHE_DIR, OUTPUT_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+    
+    if (!fs.existsSync(GEOIP_DB_PATH)) { console.error('MaxMind DB not found'); process.exit(1); }
+    
+    console.log('\n╔═══════════════════════════════════════════════════════════════╗');
+    console.log('║   TorFlow Historical Fetcher (TRUE Parallel + MaxMind)        ║');
+    console.log('╚═══════════════════════════════════════════════════════════════╝\n');
+    
+    console.log('Loading MaxMind...');
+    geoReader = await maxmind.open(GEOIP_DB_PATH);
+    console.log('✓ Ready\n');
+    
+    const months = generateMonths(startYear, startMonth, endYear, endMonth);
+    console.log(`  Range:    ${startYear}-${String(startMonth).padStart(2,'0')} → ${endYear}-${String(endMonth).padStart(2,'0')} (${months.length} months)`);
+    console.log(`  Parallel: ${parallel} concurrent`);
+    console.log(`  Cache:    ${CACHE_DIR}\n`);
+    
+    const startTime = Date.now();
+    
+    // Phase 1: Downloads
+    if (!reprocess) {
+        console.log('━━━ Phase 1: Parallel Downloads ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+        Object.assign(status, { downloaded: 0, cached: 0, failed: 0, active: new Set() });
+        
+        await runParallel(months.map(({year, month}) => () => downloadArchive(year, month, months.length)), parallel);
+        console.log(`\n\n  ✓ Done: ${status.downloaded} new, ${status.cached} cached, ${status.failed} failed\n`);
+    }
+    
+    // Phase 2: Process (TRUE PARALLEL with async exec!)
+    console.log('━━━ Phase 2: Parallel Processing (MaxMind) ━━━━━━━━━━━━━━━━━━━━━\n');
+    Object.assign(status, { processed: 0, skipped: 0, totalRelays: 0, totalGeo: 0, active: new Set() });
+    
+    const results = await runParallel(
+        months.map(({year, month}) => () => {
+            const ms = `${year}-${String(month).padStart(2,'0')}`;
+            return processArchive(ms, path.join(CACHE_DIR, `consensuses-${ms}.tar.xz`), months.length);
+        }), 
+        parallel
+    );
+    
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const pct = status.totalRelays ? Math.round(status.totalGeo / status.totalRelays * 100) : 0;
+    
+    console.log('\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`  ✓ Processed:  ${status.processed} months`);
+    console.log(`  ○ Skipped:    ${status.skipped} months`);
+    console.log(`  ⚡ Relays:     ${status.totalRelays.toLocaleString()}`);
+    console.log(`  🌍 Geolocated: ${status.totalGeo.toLocaleString()} (${pct}%)`);
+    console.log(`  ⏱  Time:       ${Math.floor(elapsed/60)}m ${elapsed%60}s`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`\n  Import: node bin/ingest data/historical\n`);
+}
+
+main().catch(console.error);

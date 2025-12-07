@@ -74,3 +74,14 @@ deploy/ingest/package.json
 deploy/app/build/
 deploy/demo/build/
 deploy/ingest/build/
+
+# ----------------------------------------
+## Data Fetching (2025 update)
+# ----------------------------------------
+
+# Generated/downloaded data (too large for git)
+data/cache/
+data/current/
+data/geoip/
+data/historical/
+data/tmp/

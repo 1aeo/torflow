@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+/**
+ * Fetch Tor relay data from Onionoo API and convert to CSV format
+ * compatible with TorFlow ingestion
+ * 
+ * Uses MaxMind GeoLite2-City for IP geolocation (local database, no rate limits)
+ */
+
+'use strict';
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const maxmind = require('maxmind');
+
+// Path to MaxMind database
+const GEOIP_DB_PATH = path.join(__dirname, '..', 'data', 'geoip', 'GeoLite2-City.mmdb');
+
+// Country centroids as fallback (lng, lat)
+const COUNTRY_CENTROIDS = {
+    'AD': [1.52, 42.55], 'AE': [53.85, 23.42], 'AF': [67.71, 33.94], 'AL': [20.17, 41.15],
+    'AM': [45.04, 40.07], 'AO': [17.87, -11.20], 'AR': [-63.62, -38.42], 'AT': [14.55, 47.52],
+    'AU': [133.78, -25.27], 'AZ': [47.58, 40.14], 'BA': [17.68, 43.92], 'BD': [90.36, 23.68],
+    'BE': [4.47, 50.50], 'BG': [25.49, 42.73], 'BR': [-51.93, -14.24], 'BY': [27.95, 53.71],
+    'CA': [-106.35, 56.13], 'CH': [8.23, 46.82], 'CL': [-71.54, -35.68], 'CN': [104.20, 35.86],
+    'CO': [-74.30, 4.57], 'CZ': [15.47, 49.82], 'DE': [10.45, 51.17], 'DK': [9.50, 56.26],
+    'EE': [25.01, 58.60], 'EG': [30.80, 26.82], 'ES': [-3.75, 40.46], 'FI': [25.75, 61.92],
+    'FR': [2.21, 46.23], 'GB': [-3.44, 55.38], 'GE': [43.36, 42.32], 'GR': [21.82, 39.07],
+    'HK': [114.11, 22.40], 'HR': [15.20, 45.10], 'HU': [19.50, 47.16], 'ID': [113.92, -0.79],
+    'IE': [-8.24, 53.41], 'IL': [34.85, 31.05], 'IN': [78.96, 20.59], 'IR': [53.69, 32.43],
+    'IS': [-19.02, 64.96], 'IT': [12.57, 41.87], 'JP': [138.25, 36.20], 'KR': [127.77, 35.91],
+    'KZ': [66.92, 48.02], 'LT': [23.88, 55.17], 'LU': [6.13, 49.82], 'LV': [24.60, 56.88],
+    'MD': [28.37, 47.41], 'MX': [-102.55, 23.63], 'MY': [101.98, 4.21], 'NL': [5.29, 52.13],
+    'NO': [8.47, 60.47], 'NZ': [174.89, -40.90], 'PL': [19.15, 51.92], 'PT': [-8.22, 39.40],
+    'RO': [24.97, 45.94], 'RS': [21.01, 44.02], 'RU': [105.32, 61.52], 'SE': [18.64, 60.13],
+    'SG': [103.82, 1.35], 'SI': [15.00, 46.15], 'SK': [19.70, 48.67], 'TH': [100.99, 15.87],
+    'TR': [35.24, 38.96], 'TW': [120.96, 23.70], 'UA': [31.17, 48.38], 'US': [-95.71, 37.09],
+    'VN': [108.28, 14.06], 'ZA': [22.94, -30.56]
+};
+
+// Map Onionoo flags to TorFlow format
+function mapFlags(flags) {
+    if (!flags) return '';
+    let result = '';
+    if (flags.includes('Running')) result += 'M';
+    if (flags.includes('Guard')) result += 'G';
+    if (flags.includes('Exit')) result += 'E';
+    if (flags.includes('HSDir')) result += 'H';
+    return result || 'M';
+}
+
+// Parse IP and port from or_addresses
+function parseAddress(or_addresses) {
+    if (!or_addresses || or_addresses.length === 0) {
+        return { ip: '0.0.0.0', port: '0' };
+    }
+    const ipv4Addr = or_addresses.find(addr => !addr.includes('['));
+    const addr = ipv4Addr || or_addresses[0];
+    
+    if (addr.includes('[')) {
+        const match = addr.match(/\[([^\]]+)\]:(\d+)/);
+        if (match) return { ip: match[1], port: match[2] };
+    } else {
+        const parts = addr.split(':');
+        if (parts.length === 2) return { ip: parts[0], port: parts[1] };
+    }
+    return { ip: '0.0.0.0', port: '0' };
+}
+
+// Normalize bandwidth
+function normalizeBandwidth(bw, maxBw) {
+    if (!bw || !maxBw || maxBw === 0) return 0;
+    return bw / maxBw;
+}
+
+// Fetch all relays from Onionoo
+function fetchRelays(callback) {
+    console.log('Fetching relay data from Onionoo API...');
+    
+    const options = {
+        hostname: 'onionoo.torproject.org',
+        path: '/details?type=relay&running=true',
+        method: 'GET',
+        headers: { 'User-Agent': 'TorFlow-DataFetcher/1.0' }
+    };
+    
+    const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            try {
+                callback(null, JSON.parse(data));
+            } catch (e) {
+                callback(e);
+            }
+        });
+    });
+    
+    req.on('error', callback);
+    req.end();
+}
+
+// Get fallback coordinates from country code
+function getCountryCoords(countryCode) {
+    const cc = (countryCode || 'US').toUpperCase();
+    const coords = COUNTRY_CENTROIDS[cc] || COUNTRY_CENTROIDS['US'];
+    // Add jitter to prevent stacking
+    return { 
+        lat: coords[1] + (Math.random() - 0.5) * 2, 
+        lng: coords[0] + (Math.random() - 0.5) * 2 
+    };
+}
+
+// Geolocate IP using MaxMind
+function geolocateIP(geoReader, ip) {
+    try {
+        const result = geoReader.get(ip);
+        if (result && result.location) {
+            return {
+                lat: result.location.latitude,
+                lng: result.location.longitude
+            };
+        }
+    } catch (e) {
+        // IP not found in database
+    }
+    return null;
+}
+
+// Convert relays to CSV format
+function relaysToCSV(relays, geoReader, maxBw) {
+    const header = 'Name,Fingerprint,Flags,IP,OrPort,ObservedBW,Uptime,GuardClients,DirClients,Longitude,Latitude)';
+    
+    let geolocatedCount = 0;
+    let fallbackCount = 0;
+    
+    const lines = relays.map(relay => {
+        const addr = parseAddress(relay.or_addresses);
+        let geo = geolocateIP(geoReader, addr.ip);
+        
+        if (geo) {
+            geolocatedCount++;
+        } else {
+            geo = getCountryCoords(relay.country);
+            fallbackCount++;
+        }
+        
+        const bw = normalizeBandwidth(relay.observed_bandwidth || 0, maxBw);
+        const dirClients = relay.consensus_weight || 0;
+        
+        return [
+            (relay.nickname || 'Unnamed').replace(/,/g, ''),
+            relay.fingerprint,
+            mapFlags(relay.flags),
+            addr.ip,
+            addr.port,
+            bw.toFixed(6),
+            '',
+            '',
+            dirClients,
+            geo.lng,
+            geo.lat
+        ].join(',');
+    });
+    
+    console.log(`\nGeolocation results:`);
+    console.log(`  ✓ MaxMind lookup: ${geolocatedCount} IPs (city-level accuracy)`);
+    console.log(`  ○ Country fallback: ${fallbackCount} IPs`);
+    
+    return [header, ...lines].join('\n');
+}
+
+// Main function
+async function main() {
+    const args = process.argv.slice(2);
+    const outputDir = args.find(a => !a.startsWith('-')) || path.join(__dirname, '..', 'data', 'current');
+    
+    if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+    }
+    
+    // Check for MaxMind database
+    if (!fs.existsSync(GEOIP_DB_PATH)) {
+        console.error(`\nError: MaxMind database not found at ${GEOIP_DB_PATH}`);
+        console.error('Please download GeoLite2-City.mmdb from MaxMind.\n');
+        process.exit(1);
+    }
+    
+    console.log('\n╔════════════════════════════════════════════╗');
+    console.log('║   TorFlow Data Fetcher (MaxMind GeoIP)     ║');
+    console.log('╚════════════════════════════════════════════╝\n');
+    
+    // Load MaxMind database
+    console.log('Loading MaxMind GeoLite2-City database...');
+    const geoReader = await maxmind.open(GEOIP_DB_PATH);
+    console.log('Database loaded!\n');
+    
+    fetchRelays((err, data) => {
+        if (err) {
+            console.error('Error fetching data:', err);
+            process.exit(1);
+        }
+        
+        const relays = data.relays || [];
+        console.log(`Fetched ${relays.length} relays from Tor network`);
+        
+        const maxBw = Math.max(...relays.map(r => r.observed_bandwidth || 0));
+        
+        // Use the timestamp from the API response
+        const publishedDate = data.relays_published || new Date().toISOString();
+        const dateMatch = publishedDate.match(/(\d{4})-(\d{2})-(\d{2})/);
+        const dateStr = dateMatch ? `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}-00-00-00` : 
+                        new Date().toISOString().replace(/[T:]/g, '-').substring(0, 19);
+        
+        const filename = `relays-${dateStr}.csv`;
+        const filepath = path.join(outputDir, filename);
+        
+        console.log('\nGeolocating all relay IPs...');
+        const csv = relaysToCSV(relays, geoReader, maxBw);
+        fs.writeFileSync(filepath, csv);
+        
+        console.log(`\n════════════════════════════════════════════`);
+        console.log(`Data saved to: ${filepath}`);
+        console.log(`Total relays: ${relays.length}`);
+        console.log(`Published: ${publishedDate}`);
+    });
+}
+
+main().catch(console.error);

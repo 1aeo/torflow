@@ -63,13 +63,26 @@
                 lng : bucket[0].lng
             };
             var position = _getNormalizedPosition( latLng );
+            // Build label with relay count and names
+            var label;
+            if (bucket.length === 1) {
+                label = bucket[0].name;
+            } else {
+                var names = bucket.map(function(r) { return r.name; }).sort();
+                var maxDisplay = 10;
+                if (names.length <= maxDisplay) {
+                    label = bucket.length + ' relays: ' + names.join(', ');
+                } else {
+                    label = bucket.length + ' relays: ' + names.slice(0, maxDisplay).join(', ') + ' (+' + (names.length - maxDisplay) + ' more)';
+                }
+            }
             nodes.push({
                 lat: latLng.lat,
                 lng: latLng.lng,
                 x: position.x,
                 y: position.y,
                 bandwidth : totalBandwidth,
-                label: bucket.length === 1 ? bucket[0].name : bucket.length + ' relays at location'
+                label: label
             });
         });
         return nodes;

@@ -32,12 +32,14 @@
     "jade": "1.11.0",
     "lodash": "3.10.1",
     "main-bower-files": "2.7.0",
+    "maxmind": "^4.3.6",
     "merge-stream": "1.0.0",
     "moment": "2.10.6",
     "morgan": "1.6.1",
     "mysql": "2.9.0",
     "node-dir": "0.1.10",
     "run-sequence": "1.1.4",
+    "tar-stream": "^2.2.0",
     "vinyl-buffer": "1.0.0",
     "vinyl-source-stream": "1.1.0"
   }
